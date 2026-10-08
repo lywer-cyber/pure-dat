@@ -2,7 +2,7 @@
 
 - `main`: pure DAT + L1 baseline copied from the local DAT source tree.
 - `FFT`: the same DAT source and protocol, with only the registered
-  `HologramSpectrumLoss` objective and its matched training configuration
+  `HologramSpectrumLoss` objective and its matched training/test configurations
   added. It does not add LKA or replace any DAT spatial mixer.
 
 For a fair ablation, hold the dataset, split assignment, seed, optimizer,

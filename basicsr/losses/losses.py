@@ -55,6 +55,77 @@ class L1Loss(nn.Module):
 
 
 @LOSS_REGISTRY.register()
+class HologramSpectrumLoss(nn.Module):
+    """Band-limited log-spectrum loss for single-channel hologram intensity.
+
+    The target is detached so this term changes the prediction gradient only.
+    The mask is defined in normalized Fourier frequency coordinates and is
+    cached per image shape/device.
+    """
+
+    def __init__(self, loss_weight=0.01, min_radius=0.15, max_radius=0.5,
+                 correlation_weight=0.05, eps=1e-8):
+        super().__init__()
+        self.loss_weight = float(loss_weight)
+        self.min_radius = float(min_radius)
+        self.max_radius = float(max_radius)
+        self.correlation_weight = float(correlation_weight)
+        self.eps = float(eps)
+        self._cache = {}
+        if self.loss_weight < 0.0:
+            raise ValueError('loss_weight must be non-negative')
+        if not 0.0 <= self.min_radius < self.max_radius <= 0.5:
+            raise ValueError('frequency radii must satisfy 0 <= min < max <= 0.5')
+        if self.correlation_weight < 0.0:
+            raise ValueError('correlation_weight must be non-negative')
+
+    def _window_and_mask(self, height, width, device):
+        key = (height, width, device)
+        cached = self._cache.get(key)
+        if cached is None:
+            window_y = torch.hann_window(height, periodic=False, device=device,
+                                         dtype=torch.float32)
+            window_x = torch.hann_window(width, periodic=False, device=device,
+                                         dtype=torch.float32)
+            window = (window_y[:, None] * window_x[None, :]).view(
+                1, 1, height, width)
+            fy = torch.fft.fftshift(torch.fft.fftfreq(height, device=device)).view(height, 1)
+            fx = torch.fft.fftshift(torch.fft.fftfreq(width, device=device)).view(1, width)
+            radius = torch.sqrt(fx.square() + fy.square())
+            mask = (radius >= self.min_radius) & (radius <= self.max_radius)
+            cached = (window, mask.flatten())
+            self._cache[key] = cached
+        return cached
+
+    def forward(self, pred, target, **kwargs):
+        if pred.shape != target.shape:
+            raise ValueError('prediction and target shapes must match for spectrum loss')
+        if self.loss_weight == 0.0:
+            return pred.sum() * 0.0
+        pred = pred.float()
+        target = target.detach().float()
+        height, width = pred.shape[-2:]
+        window, mask = self._window_and_mask(height, width, pred.device)
+        pred_fft = torch.fft.fftshift(
+            torch.fft.fft2(pred * window, norm='ortho'), dim=(-2, -1))
+        target_fft = torch.fft.fftshift(
+            torch.fft.fft2(target * window, norm='ortho'), dim=(-2, -1))
+        pred_band = torch.log1p(pred_fft.abs()).flatten(2)[..., mask]
+        target_band = torch.log1p(target_fft.abs()).flatten(2)[..., mask]
+        magnitude_loss = F.l1_loss(pred_band, target_band)
+        pred_centered = pred_band - pred_band.mean(dim=-1, keepdim=True)
+        target_centered = target_band - target_band.mean(dim=-1, keepdim=True)
+        denominator = (
+            pred_centered.square().sum(dim=-1).sqrt()
+            * target_centered.square().sum(dim=-1).sqrt()
+        ).clamp_min(self.eps)
+        correlation = (pred_centered * target_centered).sum(dim=-1) / denominator
+        correlation_loss = (1.0 - correlation).mean()
+        return self.loss_weight * (
+            magnitude_loss + self.correlation_weight * correlation_loss)
+
+
+@LOSS_REGISTRY.register()
 class MSELoss(nn.Module):
     """MSE (L2) loss.
 
