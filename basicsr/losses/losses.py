@@ -56,11 +56,12 @@ class L1Loss(nn.Module):
 
 @LOSS_REGISTRY.register()
 class HologramSpectrumLoss(nn.Module):
-    """Band-limited log-spectrum loss for single-channel hologram intensity.
+    """Carrier-band log-spectrum loss for one-channel hologram intensity.
 
-    The target is detached so this term changes the prediction gradient only.
-    The mask is defined in normalized Fourier frequency coordinates and is
-    cached per image shape/device.
+    A Hann window limits border leakage. The magnitude term preserves carrier
+    and fringe energy, while the correlation term preserves the shape and
+    orientation of the spectrum without forcing a global intensity offset.
+    FFT calculations are kept in float32 when mixed precision is enabled.
     """
 
     def __init__(self, loss_weight=0.01, min_radius=0.15, max_radius=0.5,
@@ -83,12 +84,9 @@ class HologramSpectrumLoss(nn.Module):
         key = (height, width, device)
         cached = self._cache.get(key)
         if cached is None:
-            window_y = torch.hann_window(height, periodic=False, device=device,
-                                         dtype=torch.float32)
-            window_x = torch.hann_window(width, periodic=False, device=device,
-                                         dtype=torch.float32)
-            window = (window_y[:, None] * window_x[None, :]).view(
-                1, 1, height, width)
+            window_y = torch.hann_window(height, periodic=False, device=device, dtype=torch.float32)
+            window_x = torch.hann_window(width, periodic=False, device=device, dtype=torch.float32)
+            window = (window_y[:, None] * window_x[None, :]).view(1, 1, height, width)
             fy = torch.fft.fftshift(torch.fft.fftfreq(height, device=device)).view(height, 1)
             fx = torch.fft.fftshift(torch.fft.fftfreq(width, device=device)).view(1, width)
             radius = torch.sqrt(fx.square() + fy.square())
@@ -102,27 +100,32 @@ class HologramSpectrumLoss(nn.Module):
             raise ValueError('prediction and target shapes must match for spectrum loss')
         if self.loss_weight == 0.0:
             return pred.sum() * 0.0
-        pred = pred.float()
-        target = target.detach().float()
-        height, width = pred.shape[-2:]
-        window, mask = self._window_and_mask(height, width, pred.device)
-        pred_fft = torch.fft.fftshift(
-            torch.fft.fft2(pred * window, norm='ortho'), dim=(-2, -1))
-        target_fft = torch.fft.fftshift(
-            torch.fft.fft2(target * window, norm='ortho'), dim=(-2, -1))
-        pred_band = torch.log1p(pred_fft.abs()).flatten(2)[..., mask]
-        target_band = torch.log1p(target_fft.abs()).flatten(2)[..., mask]
-        magnitude_loss = F.l1_loss(pred_band, target_band)
-        pred_centered = pred_band - pred_band.mean(dim=-1, keepdim=True)
-        target_centered = target_band - target_band.mean(dim=-1, keepdim=True)
-        denominator = (
-            pred_centered.square().sum(dim=-1).sqrt()
-            * target_centered.square().sum(dim=-1).sqrt()
-        ).clamp_min(self.eps)
-        correlation = (pred_centered * target_centered).sum(dim=-1) / denominator
-        correlation_loss = (1.0 - correlation).mean()
-        return self.loss_weight * (
-            magnitude_loss + self.correlation_weight * correlation_loss)
+        with torch.cuda.amp.autocast(enabled=False):
+            pred = pred.float()
+            target = target.detach().float()
+            height, width = pred.shape[-2:]
+            window, mask = self._window_and_mask(height, width, pred.device)
+            pred_fft = torch.fft.fftshift(
+                torch.fft.fft2(pred * window, norm='ortho'), dim=(-2, -1)
+            )
+            target_fft = torch.fft.fftshift(
+                torch.fft.fft2(target * window, norm='ortho'), dim=(-2, -1)
+            )
+            pred_band = torch.log1p(pred_fft.abs()).flatten(2)[..., mask]
+            target_band = torch.log1p(target_fft.abs()).flatten(2)[..., mask]
+            magnitude_loss = F.l1_loss(pred_band, target_band)
+
+            pred_centered = pred_band - pred_band.mean(dim=-1, keepdim=True)
+            target_centered = target_band - target_band.mean(dim=-1, keepdim=True)
+            denominator = (
+                pred_centered.square().sum(dim=-1).sqrt()
+                * target_centered.square().sum(dim=-1).sqrt()
+            ).clamp_min(self.eps)
+            correlation = (pred_centered * target_centered).sum(dim=-1) / denominator
+            correlation_loss = (1.0 - correlation).mean()
+            return self.loss_weight * (
+                magnitude_loss + self.correlation_weight * correlation_loss
+            )
 
 
 @LOSS_REGISTRY.register()

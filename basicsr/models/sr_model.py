@@ -1,5 +1,5 @@
-import numpy as np
 import torch
+import numpy as np
 from collections import OrderedDict
 from os import path as osp
 from tqdm import tqdm
@@ -23,6 +23,9 @@ class SRModel(BaseModel):
         self.net_g = build_network(opt['network_g'])
         self.net_g = self.model_to_device(self.net_g)
         self.print_network(self.net_g)
+        train_opt = opt.get('train') or {}
+        self.use_amp = bool(train_opt.get('use_amp', False) and self.device.type == 'cuda')
+        self.scaler = None
 
         # load pretrained models
         load_path = self.opt['path'].get('pretrain_network_g', None)
@@ -36,6 +39,7 @@ class SRModel(BaseModel):
     def init_training_settings(self):
         self.net_g.train()
         train_opt = self.opt['train']
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
         self.ema_decay = train_opt.get('ema_decay', 0)
         if self.ema_decay > 0:
@@ -59,13 +63,18 @@ class SRModel(BaseModel):
         else:
             self.cri_pix = None
 
+        if train_opt.get('frequency_opt'):
+            self.cri_frequency = build_loss(train_opt['frequency_opt']).to(self.device)
+        else:
+            self.cri_frequency = None
+
         if train_opt.get('perceptual_opt'):
             self.cri_perceptual = build_loss(train_opt['perceptual_opt']).to(self.device)
         else:
             self.cri_perceptual = None
 
-        if self.cri_pix is None and self.cri_perceptual is None:
-            raise ValueError('Both pixel and perceptual losses are None.')
+        if self.cri_pix is None and self.cri_frequency is None and self.cri_perceptual is None:
+            raise ValueError('Pixel, frequency, and perceptual losses are all None.')
 
         # set up optimizers and schedulers
         self.setup_optimizers()
@@ -92,27 +101,33 @@ class SRModel(BaseModel):
 
     def optimize_parameters(self, current_iter):
         self.optimizer_g.zero_grad()
-        self.output = self.net_g(self.lq)
+        with torch.cuda.amp.autocast(enabled=self.use_amp):
+            self.output = self.net_g(self.lq)
 
-        l_total = 0
-        loss_dict = OrderedDict()
-        # pixel loss
-        if self.cri_pix:
-            l_pix = self.cri_pix(self.output, self.gt)
-            l_total += l_pix
-            loss_dict['l_pix'] = l_pix
-        # perceptual loss
-        if self.cri_perceptual:
-            l_percep, l_style = self.cri_perceptual(self.output, self.gt)
-            if l_percep is not None:
-                l_total += l_percep
-                loss_dict['l_percep'] = l_percep
-            if l_style is not None:
-                l_total += l_style
-                loss_dict['l_style'] = l_style
+            l_total = 0
+            loss_dict = OrderedDict()
+            # pixel loss
+            if self.cri_pix:
+                l_pix = self.cri_pix(self.output, self.gt)
+                l_total += l_pix
+                loss_dict['l_pix'] = l_pix
+            if self.cri_frequency:
+                l_frequency = self.cri_frequency(self.output, self.gt)
+                l_total += l_frequency
+                loss_dict['l_frequency'] = l_frequency
+            # perceptual loss
+            if self.cri_perceptual:
+                l_percep, l_style = self.cri_perceptual(self.output, self.gt)
+                if l_percep is not None:
+                    l_total += l_percep
+                    loss_dict['l_percep'] = l_percep
+                if l_style is not None:
+                    l_total += l_style
+                    loss_dict['l_style'] = l_style
 
-        l_total.backward()
-        self.optimizer_g.step()
+        self.scaler.scale(l_total).backward()
+        self.scaler.step(self.optimizer_g)
+        self.scaler.update()
 
         self.log_dict = self.reduce_loss_dict(loss_dict)
 
@@ -122,11 +137,11 @@ class SRModel(BaseModel):
     def test(self):
         if hasattr(self, 'net_g_ema'):
             self.net_g_ema.eval()
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.use_amp):
                 self.output = self.net_g_ema(self.lq)
         else:
             self.net_g.eval()
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast(enabled=self.use_amp):
                 self.output = self.net_g(self.lq)
             self.net_g.train()
 
@@ -150,6 +165,7 @@ class SRModel(BaseModel):
 
         metric_data = dict()
         use_hologram_float_metrics = bool(self.opt['val'].get('hologram_float_metrics', False))
+        empty_cuda_cache = bool(self.opt['val'].get('empty_cuda_cache', False))
         if use_pbar:
             pbar = tqdm(total=len(dataloader), unit='image')
 
@@ -179,7 +195,8 @@ class SRModel(BaseModel):
             # tentative for out of GPU memory
             del self.lq
             del self.output
-            torch.cuda.empty_cache()
+            if empty_cuda_cache:
+                torch.cuda.empty_cache()
 
             if save_img:
                 if self.opt['is_train']:
@@ -205,10 +222,28 @@ class SRModel(BaseModel):
             pbar.close()
 
         if with_metrics:
+            improved = {}
             for metric in self.metric_results.keys():
                 self.metric_results[metric] /= (idx + 1)
+                record = self.best_metric_results[dataset_name][metric]
+                value = self.metric_results[metric]
+                improved[metric] = (
+                    value > record['val'] if record['better'] == 'higher'
+                    else value < record['val']
+                )
                 # update the best metric result
                 self._update_best_metric_result(dataset_name, metric, self.metric_results[metric], current_iter)
+
+            if self.opt['is_train'] and improved.get('psnr', False):
+                logger = get_root_logger()
+                logger.info('Saving best-validation-PSNR generator at iter %s.', current_iter)
+                if hasattr(self, 'net_g_ema'):
+                    self.save_network(
+                        [self.net_g, self.net_g_ema], 'net_g', 'best_val_psnr',
+                        param_key=['params', 'params_ema']
+                    )
+                else:
+                    self.save_network(self.net_g, 'net_g', 'best_val_psnr')
 
             self._log_validation_metric_values(current_iter, dataset_name, tb_logger)
 

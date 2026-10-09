@@ -93,8 +93,16 @@ def train_pipeline(root_path):
     opt, args = parse_options(root_path, is_train=True)
     opt['root_path'] = root_path
 
-    torch.backends.cudnn.benchmark = True
-    # torch.backends.cudnn.deterministic = True
+    deterministic = bool(opt.get('deterministic_training', False))
+    torch.backends.cudnn.benchmark = not deterministic
+    torch.backends.cudnn.deterministic = deterministic
+    allow_tf32 = bool(opt.get('allow_tf32', False))
+    if torch.cuda.is_available():
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+        torch.backends.cudnn.allow_tf32 = allow_tf32
+        torch.set_float32_matmul_precision('high' if allow_tf32 else 'highest')
+    if deterministic and bool(opt.get('deterministic_algorithms', False)):
+        torch.use_deterministic_algorithms(True)
 
     # load resume states if necessary
     resume_state = load_resume_state(opt)

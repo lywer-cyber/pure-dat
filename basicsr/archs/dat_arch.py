@@ -146,7 +146,8 @@ class Spatial_Attention(nn.Module):
         qk_scale (float | None): Override default qk scale of head_dim ** -0.5 if set
         position_bias (bool): The dynamic relative position bias. Default: True
     """
-    def __init__(self, dim, idx, split_size=[8,8], dim_out=None, num_heads=6, attn_drop=0., proj_drop=0., qk_scale=None, position_bias=True):
+    def __init__(self, dim, idx, split_size=[8,8], dim_out=None, num_heads=6, attn_drop=0., proj_drop=0., qk_scale=None,
+                 position_bias=True):
         super().__init__()
         self.dim = dim
         self.dim_out = dim_out or dim
@@ -286,7 +287,8 @@ class Adaptive_Spatial_Attention(nn.Module):
                 Spatial_Attention(
                     dim//2, idx = i,
                     split_size=split_size, num_heads=num_heads//2, dim_out=dim//2,
-                    qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop, position_bias=True)
+                    qk_scale=qk_scale, attn_drop=attn_drop, proj_drop=drop,
+                    position_bias=True)
                 for i in range(self.branch_num)])
 
         if (self.rg_idx % 2 == 0 and self.b_idx  > 0 and (self.b_idx  - 2) % 4 == 0) or (self.rg_idx % 2 != 0 and self.b_idx  % 4 == 0):
@@ -428,7 +430,6 @@ class Adaptive_Spatial_Attention(nn.Module):
 
         # C-I
         attened_x = attened_x * torch.sigmoid(channel_map)
-        # S-I
         conv_x = torch.sigmoid(spatial_map) * conv_x
         conv_x = conv_x.permute(0, 2, 3, 1).contiguous().view(B, L, C)
 
@@ -530,19 +531,65 @@ class Adaptive_Channel_Attention(nn.Module):
         return x
 
 
+class LargeKernelSpatialMixer(nn.Module):
+    """Fast LKA-style spatial replacement for a DAT DSTB.
+
+    A local depthwise convolution followed by a dilated depthwise convolution
+    provides a 23x23 effective receptive field. A single pointwise attention
+    projection and output projection keep the module substantially lighter
+    than DAT's window-attention DSTB, with no recurrent path search.
+    """
+
+    def __init__(self, dim, kernel_size=7, dilation=3, proj_drop=0.):
+        super().__init__()
+        if kernel_size < 3 or kernel_size % 2 == 0:
+            raise ValueError('lka_kernel_size must be an odd integer >= 3')
+        if dilation < 1:
+            raise ValueError('lka_dilation must be a positive integer')
+
+        self.local = nn.Conv2d(dim, dim, 5, 1, 2, groups=dim)
+        self.dilated = nn.Conv2d(
+            dim, dim, kernel_size, 1,
+            padding=(kernel_size // 2) * dilation,
+            dilation=dilation, groups=dim)
+        self.attn_proj = nn.Conv2d(dim, dim, 1)
+        self.out_proj = nn.Conv2d(dim, dim, 1)
+        self.proj_drop = nn.Dropout(proj_drop)
+
+    def forward(self, x, H, W):
+        B, N, C = x.shape
+        if N != H * W:
+            raise ValueError('flattened token count does not match H * W')
+
+        feature = x.transpose(1, 2).contiguous().view(B, C, H, W)
+        attention = self.attn_proj(self.dilated(self.local(feature)))
+        mixed = self.out_proj(feature * attention)
+        mixed = mixed.flatten(2).transpose(1, 2).contiguous()
+        return self.proj_drop(mixed)
+
+
 class DATB(nn.Module):
     def __init__(self, dim, num_heads, reso=64, split_size=[2,4],shift_size=[1,2], expansion_factor=4., qkv_bias=False, qk_scale=None, drop=0.,
-                 attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, rg_idx=0, b_idx=0):
+                 attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, rg_idx=0, b_idx=0,
+                 spatial_mixer='dat', spatial_mixer_groups=None, lka_kernel_size=7,
+                 lka_dilation=3):
         super().__init__()
 
         self.norm1 = norm_layer(dim)
+        spatial_mixer_groups = set(spatial_mixer_groups or [])
 
         if b_idx % 2 == 0:
-            # DSTB
-            self.attn = Adaptive_Spatial_Attention(
-                dim, num_heads=num_heads, reso=reso, split_size=split_size, shift_size=shift_size, qkv_bias=qkv_bias, qk_scale=qk_scale,
-                drop=drop, attn_drop=attn_drop, rg_idx=rg_idx, b_idx=b_idx
-            )
+            replace_dstb = spatial_mixer == 'large_kernel' and rg_idx in spatial_mixer_groups
+            if replace_dstb:
+                self.attn = LargeKernelSpatialMixer(
+                    dim=dim, kernel_size=lka_kernel_size,
+                    dilation=lka_dilation, proj_drop=drop)
+            else:
+                # Original DSTB
+                self.attn = Adaptive_Spatial_Attention(
+                    dim, num_heads=num_heads, reso=reso, split_size=split_size, shift_size=shift_size, qkv_bias=qkv_bias, qk_scale=qk_scale,
+                    drop=drop, attn_drop=attn_drop, rg_idx=rg_idx, b_idx=b_idx,
+                )
         else:
             # DCTB
             self.attn = Adaptive_Channel_Attention(
@@ -602,10 +649,15 @@ class ResidualGroup(nn.Module):
                     depth=2,
                     use_chk=False,
                     resi_connection='1conv',
-                    rg_idx=0):
+                    rg_idx=0,
+                    spatial_mixer='dat',
+                    spatial_mixer_groups=None,
+                    lka_kernel_size=7,
+                    lka_dilation=3):
         super().__init__()
         self.use_chk = use_chk
         self.reso = reso
+        spatial_mixer_groups = set(spatial_mixer_groups or [])
 
         self.blocks = nn.ModuleList([
         DATB(
@@ -624,6 +676,10 @@ class ResidualGroup(nn.Module):
             norm_layer=norm_layer,
             rg_idx = rg_idx,
             b_idx = i,
+            spatial_mixer=spatial_mixer,
+            spatial_mixer_groups=spatial_mixer_groups,
+            lka_kernel_size=lka_kernel_size,
+            lka_dilation=lka_dilation,
             )for i in range(depth)])
 
         if resi_connection == '1conv':
@@ -642,16 +698,16 @@ class ResidualGroup(nn.Module):
         H, W = x_size
         res = x
         for blk in self.blocks:
-            if self.use_chk:
+            # Checkpointing is only useful while autograd is active. During
+            # validation it emits warnings and adds unnecessary recomputation.
+            if self.use_chk and self.training and torch.is_grad_enabled():
                 x = checkpoint.checkpoint(blk, x, x_size)
             else:
                 x = blk(x, x_size)
         x = rearrange(x, "b (h w) c -> b c h w", h=H, w=W).contiguous()
         x = self.conv(x)
         x = rearrange(x, "b c h w -> b (h w) c")
-        x = res + x
-
-        return x
+        return res + x
 
 
 class Upsample(nn.Sequential):
@@ -736,13 +792,31 @@ class DAT(nn.Module):
                 drop_path_rate=0.1,
                 act_layer=nn.GELU,
                 norm_layer=nn.LayerNorm,
-                use_chk=False,
-                upscale=2,
-                img_range=1.,
-                resi_connection='1conv',
-                upsampler='pixelshuffle',
-                **kwargs):
+                 use_chk=False,
+                 upscale=2,
+                 img_range=1.,
+                 resi_connection='1conv',
+                 upsampler='pixelshuffle',
+                 use_bicubic_residual=False,
+                 zero_init_residual_tail=False,
+                 spatial_mixer='dat',
+                 spatial_mixer_groups=None,
+                 lka_kernel_size=7,
+                 lka_dilation=3,
+                 **kwargs):
         super().__init__()
+
+        if spatial_mixer not in ('dat', 'large_kernel'):
+            raise ValueError("spatial_mixer must be 'dat' or 'large_kernel'")
+        spatial_mixer_groups = list(spatial_mixer_groups or [])
+        invalid_groups = [idx for idx in spatial_mixer_groups
+                           if not isinstance(idx, int) or idx < 0 or idx >= len(depth)]
+        if invalid_groups:
+            raise ValueError('invalid spatial_mixer_groups: {}'.format(invalid_groups))
+        if not isinstance(lka_kernel_size, int) or lka_kernel_size < 3 or lka_kernel_size % 2 == 0:
+            raise ValueError('lka_kernel_size must be an odd integer >= 3')
+        if not isinstance(lka_dilation, int) or lka_dilation < 1:
+            raise ValueError('lka_dilation must be a positive integer')
 
         num_in_ch = in_chans
         num_out_ch = in_chans
@@ -755,6 +829,7 @@ class DAT(nn.Module):
             self.mean = torch.zeros(1, 1, 1, 1)
         self.upscale = upscale
         self.upsampler = upsampler
+        self.use_bicubic_residual = bool(use_bicubic_residual)
 
         # ------------------------- 1, Shallow Feature Extraction ------------------------- #
         self.conv_first = nn.Conv2d(num_in_ch, embed_dim, 3, 1, 1)
@@ -791,7 +866,12 @@ class DAT(nn.Module):
                 depth=depth[i],
                 use_chk=use_chk,
                 resi_connection=resi_connection,
-                rg_idx=i)
+                rg_idx=i,
+                spatial_mixer=spatial_mixer,
+                spatial_mixer_groups=spatial_mixer_groups,
+                lka_kernel_size=lka_kernel_size,
+                lka_dilation=lka_dilation,
+                )
             self.layers.append(layer)
 
         self.norm = norm_layer(curr_dim)
@@ -818,6 +898,13 @@ class DAT(nn.Module):
                                             (img_size, img_size))
 
         self.apply(self._init_weights)
+        if bool(zero_init_residual_tail):
+            if self.upsampler == 'pixelshuffle':
+                nn.init.zeros_(self.conv_last.weight)
+                nn.init.zeros_(self.conv_last.bias)
+            elif self.upsampler == 'pixelshuffledirect':
+                nn.init.zeros_(self.upsample[0].weight)
+                nn.init.zeros_(self.upsample[0].bias)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -843,6 +930,7 @@ class DAT(nn.Module):
         """
         Input: x: (B, C, H, W)
         """
+        residual_input = x
         self.mean = self.mean.type_as(x)
         x = (x - self.mean) * self.img_range
 
@@ -851,7 +939,8 @@ class DAT(nn.Module):
             x = self.conv_first(x)
             x = self.conv_after_body(self.forward_features(x)) + x
             x = self.conv_before_upsample(x)
-            x = self.conv_last(self.upsample(x))
+            x = self.upsample(x)
+            x = self.conv_last(x)
         elif self.upsampler == 'pixelshuffledirect':
             # for lightweight SR
             x = self.conv_first(x)
@@ -859,6 +948,13 @@ class DAT(nn.Module):
             x = self.upsample(x)
 
         x = x / self.img_range + self.mean
+        if self.use_bicubic_residual:
+            x = x + F.interpolate(
+                residual_input,
+                scale_factor=self.upscale,
+                mode='bicubic',
+                align_corners=False,
+            )
         return x
 
 
